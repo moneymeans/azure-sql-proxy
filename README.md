@@ -137,6 +137,14 @@ If any of these matter for your workflow, the relevant code is all in `index.js`
 - Try deleting `~/.azure-sql-proxy/` to regenerate the certificate.
 - Confirm `openssl version` works.
 
+## Project Status & Contributing
+
+This is provided **as-is**. It scratches my own itch and I don't plan to keep it actively maintained or respond to issues — but if it's useful to you:
+
+- **Fork it** and adapt it to your needs.
+- **Pull requests are welcome** — I'll review them when I get the chance, no promises on timing.
+- **No support, no warranty, no liability.** See the licence below.
+
 ## License
 
-MIT
+MIT License — see standard MIT terms. The software is provided "AS IS", without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and non-infringement. In no event shall the author be liable for any claim, damages, or other liability arising from the use of this software.
