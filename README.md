@@ -38,41 +38,49 @@ npm install
 # 2. Login to Azure (interactive MFA in your browser)
 az login
 
-# 3. Start the proxy
+# 3. Start the proxy. --server is the Azure SQL host to forward to;
+#    --database is optional because TablePlus sends it in its LOGIN7
+#    packet (the proxy will use whatever the client requests).
 node index.js \
   --server myserver.database.windows.net \
-  --database mydb \
   --verbose
 
-# 4. Connect your SQL client to:
+# 4. In TablePlus create a SQL Server connection with:
 #    Host:     127.0.0.1
 #    Port:     1433
 #    User:     anything (ignored)
 #    Password: anything (ignored)
-#    Database: mydb
+#    Database: mydb           <-- the proxy uses this per-connection
 ```
 
-You can also run it via the `bin` entry once installed globally or linked:
+The proxy reads the **database** field from each client's LOGIN7 packet, so one proxy instance can serve multiple TablePlus connections pointing at different databases on the same Azure SQL server without restarting. To switch Azure servers, restart with a different `--server` (or run a second proxy on a different `--port`).
+
+You can also run the binary directly:
 
 ```bash
 npm link
-azure-sql-proxy --server myserver.database.windows.net --database mydb
+azure-sql-proxy --server myserver.database.windows.net --verbose
 ```
 
 ## Usage
 
 ```
-node index.js --server <azure-server> --database <database> [options]
-
-Required:
-  --server <host>         Azure SQL server (e.g. myserver.database.windows.net)
-  --database <name>       Default database name
+node index.js --server <host> [options]
 
 Options:
-  --port <number>         Local port to listen on (default: 1433)
-  --remote-port <number>  Azure SQL port (default: 1433)
-  --verbose               Enable verbose logging
-  --help                  Show this help
+  --server <host>         Default Azure SQL server (e.g. myserver.database.windows.net).
+                          The proxy will use this unless the client's LOGIN7
+                          packet specifies a different *.database.windows.net
+                          host (most clients send the proxy's address there, so
+                          in practice this is the host the proxy connects to).
+  --database <name>       Default database name. Optional — most clients
+                          (TablePlus, DBeaver, etc.) send the database in their
+                          LOGIN7 packet and the proxy uses that, so you usually
+                          don't need this.
+  --port <number>         Local port to listen on (default: 1433).
+  --remote-port <number>  Azure SQL port (default: 1433).
+  --verbose               Enable verbose logging.
+  --help                  Show this help.
 ```
 
 ## How It Works
@@ -81,8 +89,8 @@ The proxy speaks the TDS (Tabular Data Stream) protocol on the client side and u
 
 1. **PRELOGIN** — Client sends a TDS PRELOGIN; proxy responds advertising encryption-on.
 2. **TLS handshake (client side)** — The proxy terminates TLS using a self-signed `localhost` certificate. TLS records are wrapped in TDS packets during the handshake (per the TDS spec) and switch to passthrough once secure.
-3. **LOGIN7** — The client sends a LOGIN7 with whatever dummy credentials it likes. The proxy reads the requested database name out of the packet but otherwise discards the credentials.
-4. **Azure connection** — The proxy opens a `tedious` connection to Azure SQL using your cached Entra ID access token, then sends a synthesised LOGINACK / ENVCHANGE response to the client so it considers the login successful.
+3. **LOGIN7** — The client sends a LOGIN7 with whatever dummy credentials it likes. The proxy reads the **ServerName** and **Database** fields out of the packet, discarding the rest. The Database field is used as-is. The ServerName field is used *only if it's a valid Azure SQL host* (`*.database.windows.net`); otherwise the proxy falls back to the `--server` flag (most clients send the proxy's own address here, e.g. `127.0.0.1`, which is correctly ignored).
+4. **Azure connection** — The proxy opens a `tedious` connection to the resolved Azure SQL server using your cached Entra ID access token, then sends a synthesised LOGINACK / ENVCHANGE response to the client so it considers the login successful.
 5. **Bridge mode** — Subsequent TDS messages from the client are decoded and dispatched:
    - `SQL_BATCH` (`0x01`) — executed via `tedious.execSqlBatch`; column metadata, rows, and a DONE token are streamed back.
    - `TRANSACTION_MANAGER` (`0x0e`) — `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVE TRANSACTION` are translated to SQL batches.
@@ -101,14 +109,22 @@ On first run a self-signed certificate is generated and stored at `~/.azure-sql-
 
 ## TablePlus Configuration
 
-1. Create a new **SQL Server** connection.
-2. Set:
+The simplest setup, and the one TablePlus is designed for:
+
+1. Start the proxy with a default server: `node index.js --server myserver.database.windows.net --verbose`.
+2. In TablePlus create a **SQL Server** connection:
    - **Host**: `127.0.0.1`
-   - **Port**: `1433` (or whatever you passed to `--port`)
-   - **User**: anything (e.g. `proxy`)
-   - **Password**: anything
-   - **Database**: your database name
+   - **Port**: `1433` (or whatever you passed to `--port`).
+   - **User**: anything (e.g. `proxy`).
+   - **Password**: anything.
+   - **Database**: the database you want to use (TablePlus will send this in LOGIN7 and the proxy will use it).
 3. If TablePlus complains about the certificate, set SSL mode to **Preferred** (not Required), or disable SSL verification for this connection.
+
+To switch to a different Azure server, restart the proxy with a different `--server`, or run multiple proxy instances on different ports (`--port 1434` etc.) and point each TablePlus connection at the matching port.
+
+### Routing multiple servers through one proxy
+
+The proxy reads the server name from each client's LOGIN7 packet, so in principle one proxy instance can route to multiple Azure servers. The catch is that TablePlus (and any TCP client) does its own DNS lookup of the Host field and connects to that IP — so to route by LOGIN7 you'd need to either add `/etc/hosts` entries pointing each Azure hostname to `127.0.0.1`, or use a client that lets you set the server name independently of the TCP target.
 
 ## Security Notes
 

@@ -35,11 +35,9 @@ const CONFIG = {
   verbose: !!args.verbose,
 };
 
-if (!CONFIG.azureServer || !CONFIG.database) {
-  console.error("Error: --server and --database are required.\n");
-  printUsage();
-  process.exit(1);
-}
+// --server and --database are now optional defaults: the proxy reads the
+// ServerName / Database fields from the client's LOGIN7 packet and uses those
+// when present, falling back to the CLI flags.
 
 // ---------------------------------------------------------------------------
 // TDS Constants
@@ -123,6 +121,67 @@ function parseAllHeaders(payload) {
   const totalLen = payload.readUInt32LE(0);
   if (totalLen < 4 || totalLen > payload.length) return -1;
   return totalLen;
+}
+
+// Reads a UTF-16LE string field from a LOGIN7 payload. `fieldOffset` is the
+// offset of the (ibField, cchField) pair (each uint16-LE; cchField is char
+// count, not byte count). Returns "" if the field is absent or malformed.
+function readLogin7String(payload, fieldOffset) {
+  if (payload.length < fieldOffset + 4) return "";
+  const ib = payload.readUInt16LE(fieldOffset);
+  const cch = payload.readUInt16LE(fieldOffset + 2);
+  if (cch === 0) return "";
+  const end = ib + cch * 2;
+  if (ib < 0 || end > payload.length) return "";
+  return payload.toString("utf16le", ib, end);
+}
+
+function isValidAzureSqlHost(host) {
+  return /^[A-Za-z0-9.-]+\.database\.windows\.net$/i.test(host);
+}
+
+// Builds a TDS TABULAR_RESULT packet containing an ERROR token followed by a
+// DONE_ERROR token. Suitable for both pre-login-success failures and
+// mid-session error replies.
+function buildErrorPacket(message, number = 50000) {
+  const text = message || "Unknown error";
+  const msgBuf = Buffer.from(text, "utf16le");
+  const srvName = "azure-sql-proxy";
+  const srvBuf = Buffer.from(srvName, "utf16le");
+  const dataLen = 4 + 1 + 1 + 2 + msgBuf.length + 1 + srvBuf.length + 1 + 4;
+  const errToken = Buffer.alloc(3 + dataLen);
+  let o = 0;
+  errToken.writeUInt8(0xaa, o++);
+  errToken.writeUInt16LE(dataLen, o);
+  o += 2;
+  errToken.writeUInt32LE(number, o);
+  o += 4;
+  errToken.writeUInt8(1, o++); // state
+  errToken.writeUInt8(16, o++); // class (>= 11 = error)
+  errToken.writeUInt16LE(text.length, o);
+  o += 2;
+  msgBuf.copy(errToken, o);
+  o += msgBuf.length;
+  errToken.writeUInt8(srvName.length, o++);
+  srvBuf.copy(errToken, o);
+  o += srvBuf.length;
+  errToken.writeUInt8(0, o++); // line number length
+  errToken.writeUInt32LE(0, o); // line number
+
+  const done = Buffer.alloc(13, 0);
+  done.writeUInt8(0xfd, 0);
+  done.writeUInt16LE(0x0002, 1); // DONE_ERROR
+
+  return wrapTds(PKT.TABULAR_RESULT, Buffer.concat([errToken, done]));
+}
+
+function sendLoginError(socket, message) {
+  if (!socket || socket.destroyed) return;
+  try {
+    socket.write(buildErrorPacket(message));
+  } catch (err) {
+    log("Failed to send login error:", err.message);
+  }
 }
 
 class TdsMessageReader {
@@ -477,22 +536,47 @@ function handleConnection(clientSocket) {
 
       log("Received client LOGIN7");
 
-      let database = CONFIG.database;
-      if (msg.payload.length >= 94) {
-        const ibDb = msg.payload.readUInt16LE(68);
-        const cchDb = msg.payload.readUInt16LE(70);
-        if (cchDb > 0 && ibDb + cchDb * 2 <= msg.payload.length) {
-          const clientDb = msg.payload.toString(
-            "utf16le",
-            ibDb,
-            ibDb + cchDb * 2,
-          );
-          if (clientDb) database = clientDb;
-        }
-      }
-      log("Database:", database);
+      const clientServer = readLogin7String(msg.payload, 52);
+      const clientDatabase = readLogin7String(msg.payload, 68);
 
-      phase4_connectAzure(database);
+      // Use the client's LOGIN7 server name only if it looks like an Azure SQL
+      // host. Clients commonly send the proxy's address (e.g. 127.0.0.1:11433)
+      // there, which we should ignore in favour of --server.
+      const clientServerIsAzure =
+        clientServer && isValidAzureSqlHost(clientServer);
+      const server = clientServerIsAzure ? clientServer : CONFIG.azureServer;
+      const database = clientDatabase || CONFIG.database;
+
+      if (!server) {
+        log("No Azure server configured (client sent:", clientServer || "<empty>", ")");
+        sendLoginError(
+          clientTlsSocket,
+          "azure-sql-proxy: no Azure SQL server configured. Pass --server <host>.database.windows.net to the proxy.",
+        );
+        cleanup();
+        return;
+      }
+      if (!isValidAzureSqlHost(server)) {
+        log("Rejecting non-Azure server:", server);
+        sendLoginError(
+          clientTlsSocket,
+          `azure-sql-proxy: refusing to connect to '${server}'. Server must end with .database.windows.net.`,
+        );
+        cleanup();
+        return;
+      }
+      if (!database) {
+        log("No database provided by client or via --database");
+        sendLoginError(
+          clientTlsSocket,
+          "azure-sql-proxy: no database configured. Set the database in your client, or pass --database to the proxy.",
+        );
+        cleanup();
+        return;
+      }
+
+      log("Server:", server, "Database:", database);
+      phase4_connectAzure(server, database);
     });
   }
 
@@ -500,7 +584,7 @@ function handleConnection(clientSocket) {
   // Phase 4: Connect to Azure via tedious (handles all TDS/TLS/FEDAUTH)
   // =========================================================================
 
-  async function phase4_connectAzure(database) {
+  async function phase4_connectAzure(server, database) {
     let token;
     try {
       token = await getAzureToken();
@@ -513,7 +597,7 @@ function handleConnection(clientSocket) {
     log("Connecting to Azure SQL via tedious...");
 
     azureConn = new Connection({
-      server: CONFIG.azureServer,
+      server,
       authentication: {
         type: "azure-active-directory-access-token",
         options: { token },
@@ -744,33 +828,13 @@ function handleConnection(clientSocket) {
     }
 
     function sendErrorResponse(err) {
-      const msgBuf = Buffer.from(err.message || "Unknown error", "utf16le");
-      const srvBuf = Buffer.from("azure-sql-proxy", "utf16le");
-      const dataLen = 4 + 1 + 1 + 2 + msgBuf.length + 1 + srvBuf.length + 1 + 4;
-      const errToken = Buffer.alloc(3 + dataLen);
-      let o = 0;
-      errToken.writeUInt8(0xaa, o++);
-      errToken.writeUInt16LE(dataLen, o);
-      o += 2;
-      errToken.writeUInt32LE(err.number || 50000, o);
-      o += 4;
-      errToken.writeUInt8(1, o++);
-      errToken.writeUInt8(16, o++);
-      errToken.writeUInt16LE((err.message || "Unknown error").length, o);
-      o += 2;
-      msgBuf.copy(errToken, o);
-      o += msgBuf.length;
-      errToken.writeUInt8("azure-sql-proxy".length, o++);
-      srvBuf.copy(errToken, o);
-      o += srvBuf.length;
-      errToken.writeUInt8(0, o++);
-      errToken.writeUInt32LE(0, o);
-
-      const done = Buffer.alloc(13, 0);
-      done.writeUInt8(0xfd, 0);
-      done.writeUInt16LE(0x0002, 1); // DONE_ERROR
-
-      sendTdsResponse(Buffer.concat([errToken, done]));
+      const pkt = buildErrorPacket(
+        err.message || "Unknown error",
+        err.number || 50000,
+      );
+      if (clientTlsSocket && !clientTlsSocket.destroyed) {
+        clientTlsSocket.write(pkt);
+      }
     }
   }
 }
@@ -967,22 +1031,26 @@ function printUsage() {
 azure-sql-proxy - Local proxy for Azure SQL with Entra ID (MFA) authentication
 
 Usage:
-  node index.js --server <azure-server> --database <database> [options]
-
-Required:
-  --server <host>        Azure SQL server (e.g. myserver.database.windows.net)
-  --database <name>      Default database name
+  node index.js --server <host> [options]
 
 Options:
-  --port <number>        Local port to listen on (default: 1433)
-  --remote-port <number> Azure SQL port (default: 1433)
-  --verbose              Enable verbose logging
-  --help                 Show this help
+  --server <host>        Default Azure SQL server (e.g. myserver.database.windows.net).
+                         If a client sends a different host in its LOGIN7 packet
+                         (must end with .database.windows.net), the proxy uses
+                         that instead.
+  --database <name>      Default database name. Optional: most clients (TablePlus,
+                         DBeaver, etc.) send the database in their LOGIN7 packet,
+                         and the proxy uses that, so you usually don't need this.
+  --port <number>        Local port to listen on (default: 1433).
+  --remote-port <number> Azure SQL port (default: 1433).
+  --verbose              Enable verbose logging.
+  --help                 Show this help.
 
 How it works:
   1. Login to Azure: az login
-  2. Start the proxy: node index.js --server myserver.database.windows.net --database mydb --verbose
-  3. Connect TablePlus to 127.0.0.1:1433 (any username/password)
+  2. Start the proxy: node index.js --server myserver.database.windows.net --verbose
+  3. In TablePlus, set Host=127.0.0.1, Port=1433, Database=your db,
+     User/Pass=anything.
   `);
 }
 
@@ -1017,12 +1085,16 @@ async function main() {
   });
 
   server.listen(CONFIG.localPort, "127.0.0.1", () => {
+    const remote = CONFIG.azureServer
+      ? `${CONFIG.azureServer}:${CONFIG.azurePort}`
+      : "(read from client LOGIN7)";
+    const db = CONFIG.database || "(read from client LOGIN7)";
     console.log(`
   azure-sql-proxy is running!
 
   Local:    127.0.0.1:${CONFIG.localPort}
-  Remote:   ${CONFIG.azureServer}:${CONFIG.azurePort}
-  Database: ${CONFIG.database}
+  Remote:   ${remote}
+  Database: ${db}
 
   Connect your SQL client to 127.0.0.1:${CONFIG.localPort}
   User/Pass: anything (ignored)
