@@ -1,0 +1,25 @@
+{
+  "name": "azure-sql-proxy",
+  "version": "1.0.0",
+  "description": "Local TDS proxy for Azure SQL with Entra ID (MFA) authentication",
+  "main": "index.js",
+  "bin": {
+    "azure-sql-proxy": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "azure",
+    "sql",
+    "proxy",
+    "mfa",
+    "entra-id",
+    "tableplus"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "tedious": "^19.2.1"
+  }
+}
