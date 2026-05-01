@@ -110,6 +110,12 @@ On first run a self-signed certificate is generated and stored at `~/.azure-sql-
    - **Database**: your database name
 3. If TablePlus complains about the certificate, set SSL mode to **Preferred** (not Required), or disable SSL verification for this connection.
 
+## Security Notes
+
+- The proxy listens on `127.0.0.1` only, so it isn't reachable from the network.
+- **There is no authentication on the local listener.** While the proxy is running, *any local process* under your user account can connect to it and run queries against Azure SQL using your Entra ID token. Don't leave the proxy running on a shared / multi-user machine, and shut it down (`Ctrl+C`) when you're not actively using it.
+- The Azure-side connection is TLS with proper certificate validation by `tedious`. The local-hop TLS uses a self-signed cert stored at `~/.azure-sql-proxy/`, with the private key written `0600`.
+
 ## Limitations
 
 This is a pragmatic proxy, not a full TDS server. Known gaps:

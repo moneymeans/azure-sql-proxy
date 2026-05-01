@@ -4,7 +4,8 @@
 
 const net = require("net");
 const tls = require("tls");
-const { execSync } = require("child_process");
+const { execFile, execFileSync } = require("child_process");
+const { promisify } = require("util");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -12,6 +13,8 @@ const crypto = require("crypto");
 const { Duplex } = require("stream");
 const { Connection } = require("tedious");
 const { versions: TDS_VERSIONS } = require("tedious/lib/tds-versions");
+
+const execFileAsync = promisify(execFile);
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -57,28 +60,44 @@ const STATUS_EOM = 0x01;
 
 let cachedToken = null;
 let tokenExpiresAt = 0;
+let inFlightRefresh = null;
 
-function getAzureToken() {
+async function getAzureToken() {
   const now = Date.now();
   if (cachedToken && tokenExpiresAt - now > 5 * 60 * 1000) {
     return cachedToken;
   }
+  if (inFlightRefresh) return inFlightRefresh;
 
-  log("Acquiring Azure AD token via az cli...");
-  try {
-    const raw = execSync(
-      "az account get-access-token --resource https://database.windows.net/ --output json",
-      { encoding: "utf8", timeout: 30000 },
-    );
-    const parsed = JSON.parse(raw);
-    cachedToken = parsed.accessToken;
-    tokenExpiresAt = parsed.expires_on * 1000;
-    log("Token acquired, expires", new Date(tokenExpiresAt).toISOString());
-    return cachedToken;
-  } catch (err) {
-    console.error("Failed to get Azure token. Run `az login` first.");
-    throw err;
-  }
+  inFlightRefresh = (async () => {
+    log("Acquiring Azure AD token via az cli...");
+    try {
+      const { stdout } = await execFileAsync(
+        "az",
+        [
+          "account",
+          "get-access-token",
+          "--resource",
+          "https://database.windows.net/",
+          "--output",
+          "json",
+        ],
+        { timeout: 30000 },
+      );
+      const parsed = JSON.parse(stdout);
+      cachedToken = parsed.accessToken;
+      tokenExpiresAt = parsed.expires_on * 1000;
+      log("Token acquired, expires", new Date(tokenExpiresAt).toISOString());
+      return cachedToken;
+    } catch (err) {
+      console.error("Failed to get Azure token. Run `az login` first.");
+      throw err;
+    } finally {
+      inFlightRefresh = null;
+    }
+  })();
+
+  return inFlightRefresh;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +113,16 @@ function wrapTds(type, payload) {
   hdr.writeUInt8(1, 6);
   hdr.writeUInt8(0, 7);
   return Buffer.concat([hdr, payload]);
+}
+
+// Reads the leading ALL_HEADERS section length from a SQL_BATCH /
+// TRANSACTION_MANAGER payload. Returns the offset where the rest of the
+// payload starts, or -1 if the header is malformed.
+function parseAllHeaders(payload) {
+  if (payload.length < 4) return -1;
+  const totalLen = payload.readUInt32LE(0);
+  if (totalLen < 4 || totalLen > payload.length) return -1;
+  return totalLen;
 }
 
 class TdsMessageReader {
@@ -216,14 +245,43 @@ function ensureSelfSignedCert() {
   }
 
   if (!fs.existsSync(certDir)) {
-    fs.mkdirSync(certDir, { recursive: true });
+    fs.mkdirSync(certDir, { recursive: true, mode: 0o700 });
   }
 
   log("Generating self-signed TLS certificate...");
-  execSync(
-    `openssl req -x509 -newkey rsa:2048 -keyout "${keyPath}" -out "${certPath}" -days 3650 -nodes -subj "/CN=localhost"`,
-    { stdio: "pipe" },
-  );
+  try {
+    execFileSync(
+      "openssl",
+      [
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-keyout",
+        keyPath,
+        "-out",
+        certPath,
+        "-days",
+        "3650",
+        "-nodes",
+        "-subj",
+        "/CN=localhost",
+      ],
+      { stdio: "pipe" },
+    );
+  } catch (err) {
+    console.error(
+      "Failed to generate TLS certificate via openssl. Ensure openssl is installed and on PATH.",
+    );
+    throw err;
+  }
+
+  // Tighten key file permissions to owner-read/write only.
+  try {
+    fs.chmodSync(keyPath, 0o600);
+  } catch (err) {
+    log("Could not chmod key file:", err.message);
+  }
 
   return { key: fs.readFileSync(keyPath), cert: fs.readFileSync(certPath) };
 }
@@ -442,14 +500,15 @@ function handleConnection(clientSocket) {
   // Phase 4: Connect to Azure via tedious (handles all TDS/TLS/FEDAUTH)
   // =========================================================================
 
-  function phase4_connectAzure(database) {
+  async function phase4_connectAzure(database) {
     let token;
     try {
-      token = getAzureToken();
+      token = await getAzureToken();
     } catch {
       cleanup();
       return;
     }
+    if (destroyed) return;
 
     log("Connecting to Azure SQL via tedious...");
 
@@ -464,7 +523,7 @@ function handleConnection(clientSocket) {
         encrypt: true,
         port: CONFIG.azurePort,
         connectTimeout: 30000,
-        requestTimeout: 0,
+        requestTimeout: 60000,
         packetSize: 4096,
       },
     });
@@ -489,6 +548,12 @@ function handleConnection(clientSocket) {
 
     azureConn.on("error", (err) => {
       log("Azure error:", err.message);
+      cleanup();
+    });
+
+    azureConn.on("end", () => {
+      log("Azure connection ended");
+      cleanup();
     });
 
     azureConn.connect();
@@ -510,6 +575,7 @@ function handleConnection(clientSocket) {
 
     // tedious can only execute one request at a time.
     // Queue incoming messages and process them sequentially.
+    const MAX_QUEUE = 32;
     const messageQueue = [];
     let busy = false;
 
@@ -521,6 +587,12 @@ function handleConnection(clientSocket) {
           // ATTENTION - cancel immediately, don't queue
           log("ATTENTION from client");
           azureConn.cancel();
+        } else if (messageQueue.length >= MAX_QUEUE) {
+          log("Queue full, rejecting message of type", "0x" + msg.type.toString(16));
+          sendErrorResponse({
+            message: `azure-sql-proxy: too many pending requests (cap=${MAX_QUEUE})`,
+            number: 50000,
+          });
         } else {
           messageQueue.push(msg);
           processQueue();
@@ -554,13 +626,15 @@ function handleConnection(clientSocket) {
     }
 
     function handleSqlBatch(payload, queueDone) {
-      // Extract SQL text (skip ALL_HEADERS)
-      let offset = 0;
-      if (payload.length >= 4) {
-        const totalLen = payload.readUInt32LE(0);
-        if (totalLen > 4 && totalLen <= payload.length) {
-          offset = totalLen;
-        }
+      // Skip ALL_HEADERS. The first uint32-LE is the total header length.
+      const offset = parseAllHeaders(payload);
+      if (offset === -1) {
+        sendErrorResponse({
+          message: "Malformed SQL_BATCH ALL_HEADERS",
+          number: 50000,
+        });
+        queueDone();
+        return;
       }
       const sql = payload.toString("utf16le", offset);
       log("SQL:", sql.substring(0, 120).replace(/[\r\n]+/g, " "));
@@ -617,20 +691,14 @@ function handleConnection(clientSocket) {
     }
 
     function handleTransactionManager(payload, queueDone) {
-      if (payload.length < 8) {
+      const offset = parseAllHeaders(payload);
+      if (offset === -1 || payload.length < offset + 2) {
         sendErrorResponse({
-          message: "Invalid transaction request",
+          message: "Malformed transaction request",
           number: 50000,
         });
         queueDone();
         return;
-      }
-
-      // Skip ALL_HEADERS
-      let offset = 0;
-      if (payload.length >= 4) {
-        const headerLen = payload.readUInt32LE(0);
-        if (headerLen > 4 && headerLen <= payload.length) offset = headerLen;
       }
 
       const requestType = payload.readUInt16LE(offset);
@@ -724,19 +792,21 @@ function buildColMetadataToken(columns) {
     prefix.writeUInt16LE(col.nullable ? 0x0001 : 0x0000, 4);
     parts.push(prefix);
 
-    // TYPE_INFO: use NVARCHAR(MAX) for simplicity
+    // TYPE_INFO: NVARCHAR(MAX). Max length 0xFFFF = PARTLENTYPE.
     const typeInfo = Buffer.alloc(8);
     typeInfo.writeUInt8(0xe7, 0); // NVARCHAR
-    typeInfo.writeUInt16LE(8000, 1); // max length
-    typeInfo.writeUInt8(0x09, 3); // collation
+    typeInfo.writeUInt16LE(0xffff, 1); // PARTLENTYPE
+    typeInfo.writeUInt8(0x09, 3); // collation: SQL_Latin1_General_CP1_CI_AS
     typeInfo.writeUInt8(0x04, 4);
     typeInfo.writeUInt8(0xd0, 5);
     typeInfo.writeUInt8(0x00, 6);
     typeInfo.writeUInt8(0x34, 7);
     parts.push(typeInfo);
 
-    // Column name
-    const name = col.colName || "";
+    // Column name (B_VARCHAR: 1-byte char count, max 255).
+    const rawName = col.colName || "";
+    const name =
+      rawName.length > 255 ? rawName.substring(0, 255) : rawName;
     const nameBuf = Buffer.from(name, "utf16le");
     const nameLen = Buffer.alloc(1);
     nameLen.writeUInt8(name.length, 0);
@@ -746,27 +816,49 @@ function buildColMetadataToken(columns) {
   return Buffer.concat(parts);
 }
 
+const PLP_NULL = Buffer.from([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+const PLP_UNKNOWN_LEN = Buffer.from([
+  0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+]);
+const PLP_TERMINATOR = Buffer.from([0x00, 0x00, 0x00, 0x00]);
+const PLP_CHUNK_SIZE = 8000; // bytes per chunk, must fit in uint32 (and well within)
+
+function encodePlpValue(encoded) {
+  // Length prefix: actual byte length (fits in uint64 for any realistic value).
+  const lenBuf = Buffer.alloc(8);
+  lenBuf.writeBigUInt64LE(BigInt(encoded.length), 0);
+
+  const chunks = [lenBuf];
+  for (let i = 0; i < encoded.length; i += PLP_CHUNK_SIZE) {
+    const slice = encoded.subarray(i, i + PLP_CHUNK_SIZE);
+    const chunkLen = Buffer.alloc(4);
+    chunkLen.writeUInt32LE(slice.length, 0);
+    chunks.push(chunkLen, slice);
+  }
+  chunks.push(PLP_TERMINATOR);
+  return Buffer.concat(chunks);
+}
+
 function buildRowToken(columns) {
   const parts = [Buffer.from([0xd1])];
 
   for (const col of columns) {
     const value = col.value;
     if (value === null || value === undefined) {
-      parts.push(Buffer.from([0xff, 0xff])); // NULL
-    } else {
-      let strVal;
-      if (value instanceof Date) {
-        strVal = value.toISOString();
-      } else if (typeof value === "object") {
-        strVal = JSON.stringify(value);
-      } else {
-        strVal = String(value);
-      }
-      const encoded = Buffer.from(strVal, "utf16le");
-      const lenBuf = Buffer.alloc(2);
-      lenBuf.writeUInt16LE(encoded.length, 0);
-      parts.push(lenBuf, encoded);
+      parts.push(PLP_NULL);
+      continue;
     }
+
+    let strVal;
+    if (value instanceof Date) {
+      strVal = value.toISOString();
+    } else if (typeof value === "object") {
+      strVal = JSON.stringify(value);
+    } else {
+      strVal = String(value);
+    }
+    const encoded = Buffer.from(strVal, "utf16le");
+    parts.push(encodePlpValue(encoded));
   }
 
   return Buffer.concat(parts);
@@ -830,18 +922,42 @@ function log(...args) {
 }
 
 function parseArgs(argv) {
+  const KNOWN_FLAGS = {
+    port: "value",
+    server: "value",
+    "remote-port": "value",
+    database: "value",
+    verbose: "boolean",
+    help: "boolean",
+  };
   const result = {};
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i].startsWith("--")) {
-      const key = argv[i].slice(2);
-      const next = argv[i + 1];
-      if (next && !next.startsWith("--")) {
-        result[key] = next;
-        i++;
-      } else {
-        result[key] = true;
-      }
+    const tok = argv[i];
+    if (!tok.startsWith("--")) {
+      console.error(`Error: unexpected positional argument '${tok}'.`);
+      process.exit(1);
     }
+    const key = tok.slice(2);
+    const kind = KNOWN_FLAGS[key];
+    if (!kind) {
+      console.error(`Error: unknown flag '--${key}'.`);
+      process.exit(1);
+    }
+    if (kind === "boolean") {
+      result[key] = true;
+      continue;
+    }
+    const next = argv[i + 1];
+    if (next === undefined || next.startsWith("--")) {
+      console.error(`Error: flag '--${key}' requires a value.`);
+      process.exit(1);
+    }
+    if (Object.prototype.hasOwnProperty.call(result, key)) {
+      console.error(`Error: flag '--${key}' specified more than once.`);
+      process.exit(1);
+    }
+    result[key] = next;
+    i++;
   }
   return result;
 }
@@ -874,28 +990,34 @@ How it works:
 // Start
 // ---------------------------------------------------------------------------
 
-try {
-  getAzureToken();
-  console.log("Azure AD token acquired successfully.");
-} catch {
-  process.exit(1);
-}
-
-ensureSelfSignedCert();
-console.log("TLS certificate ready.");
-
-const server = net.createServer(handleConnection);
-
-server.on("error", (err) => {
-  if (err.code === "EADDRINUSE") {
-    console.error(`Error: Port ${CONFIG.localPort} is already in use.`);
+async function main() {
+  try {
+    await getAzureToken();
+    console.log("Azure AD token acquired successfully.");
+  } catch {
     process.exit(1);
   }
-  console.error("Server error:", err.message);
-});
 
-server.listen(CONFIG.localPort, "127.0.0.1", () => {
-  console.log(`
+  ensureSelfSignedCert();
+  console.log("TLS certificate ready.");
+
+  const activeConnections = new Set();
+  const server = net.createServer((socket) => {
+    activeConnections.add(socket);
+    socket.on("close", () => activeConnections.delete(socket));
+    handleConnection(socket);
+  });
+
+  server.on("error", (err) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`Error: Port ${CONFIG.localPort} is already in use.`);
+      process.exit(1);
+    }
+    console.error("Server error:", err.message);
+  });
+
+  server.listen(CONFIG.localPort, "127.0.0.1", () => {
+    console.log(`
   azure-sql-proxy is running!
 
   Local:    127.0.0.1:${CONFIG.localPort}
@@ -906,11 +1028,38 @@ server.listen(CONFIG.localPort, "127.0.0.1", () => {
   User/Pass: anything (ignored)
 
   Press Ctrl+C to stop.
-  `);
-});
+    `);
+  });
 
-process.on("SIGINT", () => {
-  console.log("\nShutting down...");
-  server.close();
-  process.exit(0);
+  let shuttingDown = false;
+  process.on("SIGINT", () => {
+    if (shuttingDown) {
+      console.log("\nForcing immediate exit.");
+      process.exit(1);
+    }
+    shuttingDown = true;
+    console.log("\nShutting down...");
+    server.close();
+    const drainCap = setTimeout(() => {
+      console.log(
+        `Drain timed out with ${activeConnections.size} connection(s) still open; forcing exit.`,
+      );
+      for (const sock of activeConnections) sock.destroy();
+      process.exit(0);
+    }, 5000);
+    drainCap.unref();
+    const checkDrained = setInterval(() => {
+      if (activeConnections.size === 0) {
+        clearInterval(checkDrained);
+        clearTimeout(drainCap);
+        process.exit(0);
+      }
+    }, 100);
+    checkDrained.unref();
+  });
+}
+
+main().catch((err) => {
+  console.error("Fatal:", err);
+  process.exit(1);
 });
