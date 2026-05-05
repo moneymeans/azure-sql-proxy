@@ -51,6 +51,11 @@ const PKT = {
   PRELOGIN: 0x12,
 };
 const STATUS_EOM = 0x01;
+const STATUS_NORMAL = 0x00;
+// TDS packet length is a uint16, so payload per packet is capped at
+// 65535 - TDS_HEADER_LEN. We use a smaller value matching the LOGIN7
+// negotiated packetSize (4096) to stay compatible with strict clients.
+const MAX_PACKET_PAYLOAD = 4096 - TDS_HEADER_LEN;
 
 // ---------------------------------------------------------------------------
 // Azure Token Cache
@@ -111,6 +116,32 @@ function wrapTds(type, payload) {
   hdr.writeUInt8(1, 6);
   hdr.writeUInt8(0, 7);
   return Buffer.concat([hdr, payload]);
+}
+
+// Splits a large payload across multiple TDS packets. Each non-final packet
+// has STATUS_NORMAL; the final one has STATUS_EOM. Packet IDs increment
+// modulo 256.
+function wrapTdsChunked(type, payload) {
+  if (payload.length <= MAX_PACKET_PAYLOAD) return wrapTds(type, payload);
+  const chunks = [];
+  let offset = 0;
+  let pktId = 1;
+  while (offset < payload.length) {
+    const end = Math.min(offset + MAX_PACKET_PAYLOAD, payload.length);
+    const slice = payload.subarray(offset, end);
+    const isLast = end === payload.length;
+    const hdr = Buffer.alloc(TDS_HEADER_LEN);
+    hdr.writeUInt8(type, 0);
+    hdr.writeUInt8(isLast ? STATUS_EOM : STATUS_NORMAL, 1);
+    hdr.writeUInt16BE(TDS_HEADER_LEN + slice.length, 2);
+    hdr.writeUInt16BE(0, 4);
+    hdr.writeUInt8(pktId & 0xff, 6);
+    hdr.writeUInt8(0, 7);
+    chunks.push(hdr, slice);
+    offset = end;
+    pktId++;
+  }
+  return Buffer.concat(chunks);
 }
 
 // Reads the leading ALL_HEADERS section length from a SQL_BATCH /
@@ -821,7 +852,7 @@ function handleConnection(clientSocket) {
 
     function sendTdsResponse(tokenData) {
       log("Sending TDS response:", tokenData.length, "bytes");
-      const pkt = wrapTds(PKT.TABULAR_RESULT, tokenData);
+      const pkt = wrapTdsChunked(PKT.TABULAR_RESULT, tokenData);
       if (clientTlsSocket && !clientTlsSocket.destroyed) {
         clientTlsSocket.write(pkt);
       }
