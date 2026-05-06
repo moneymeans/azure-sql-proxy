@@ -211,7 +211,7 @@ function sendLoginError(socket, message) {
   try {
     socket.write(buildErrorPacket(message));
   } catch (err) {
-    log("Failed to send login error:", err.message);
+    warn("Failed to send login error:", err.message);
   }
 }
 
@@ -459,7 +459,7 @@ function buildLoginResponse(database) {
 
 function handleConnection(clientSocket) {
   const clientAddr = clientSocket.remoteAddress + ":" + clientSocket.remotePort;
-  log("Client connected:", clientAddr);
+  info("Client connected:", clientAddr);
 
   let clientTlsSocket = null;
   let azureConn = null;
@@ -477,11 +477,11 @@ function handleConnection(clientSocket) {
       } catch {}
     }
     if (clientSocket && !clientSocket.destroyed) clientSocket.destroy();
-    log("Cleaned up:", clientAddr);
+    info("Cleaned up:", clientAddr);
   }
 
   clientSocket.on("error", (err) => {
-    log("Client error:", err.message);
+    warn("Client error:", err.message);
     cleanup();
   });
 
@@ -501,7 +501,7 @@ function handleConnection(clientSocket) {
     clientSocket.removeListener("data", onPrelogin);
 
     if (msg.type !== PKT.PRELOGIN) {
-      log("Expected PRELOGIN, got:", "0x" + msg.type.toString(16));
+      warn("Expected PRELOGIN, got:", "0x" + msg.type.toString(16));
       cleanup();
       return;
     }
@@ -538,7 +538,7 @@ function handleConnection(clientSocket) {
     });
 
     clientTlsSocket.on("error", (err) => {
-      log("Client TLS error:", err.message);
+      warn("Client TLS error:", err.message);
       cleanup();
     });
   }
@@ -560,7 +560,7 @@ function handleConnection(clientSocket) {
       clientTlsSocket.removeListener("data", onLogin);
 
       if (msg.type !== PKT.LOGIN7) {
-        log("Expected LOGIN7, got:", "0x" + msg.type.toString(16));
+        warn("Expected LOGIN7, got:", "0x" + msg.type.toString(16));
         cleanup();
         return;
       }
@@ -579,7 +579,7 @@ function handleConnection(clientSocket) {
       const database = clientDatabase || CONFIG.database;
 
       if (!server) {
-        log("No Azure server configured (client sent:", clientServer || "<empty>", ")");
+        warn("No Azure server configured (client sent:", clientServer || "<empty>", ")");
         sendLoginError(
           clientTlsSocket,
           "azure-sql-proxy: no Azure SQL server configured. Pass --server <host>.database.windows.net to the proxy.",
@@ -588,7 +588,7 @@ function handleConnection(clientSocket) {
         return;
       }
       if (!isValidAzureSqlHost(server)) {
-        log("Rejecting non-Azure server:", server);
+        warn("Rejecting non-Azure server:", server);
         sendLoginError(
           clientTlsSocket,
           `azure-sql-proxy: refusing to connect to '${server}'. Server must end with .database.windows.net.`,
@@ -597,7 +597,7 @@ function handleConnection(clientSocket) {
         return;
       }
       if (!database) {
-        log("No database provided by client or via --database");
+        warn("No database provided by client or via --database");
         sendLoginError(
           clientTlsSocket,
           "azure-sql-proxy: no database configured. Set the database in your client, or pass --database to the proxy.",
@@ -606,7 +606,7 @@ function handleConnection(clientSocket) {
         return;
       }
 
-      log("Server:", server, "Database:", database);
+      info("Server:", server, "Database:", database);
       phase4_connectAzure(server, database);
     });
   }
@@ -645,12 +645,12 @@ function handleConnection(clientSocket) {
 
     azureConn.on("connect", (err) => {
       if (err) {
-        log("Azure connection error:", err.message);
+        warn("Azure connection error:", err.message);
         cleanup();
         return;
       }
 
-      log("Connected to Azure SQL!");
+      info("Connected to Azure SQL");
 
       // Send login success to client
       const loginResponse = buildLoginResponse(database);
@@ -662,7 +662,7 @@ function handleConnection(clientSocket) {
     });
 
     azureConn.on("error", (err) => {
-      log("Azure error:", err.message);
+      warn("Azure error:", err.message);
       cleanup();
     });
 
@@ -755,16 +755,15 @@ function handleConnection(clientSocket) {
       log("SQL:", sql.substring(0, 120).replace(/[\r\n]+/g, " "));
 
       const responseChunks = [];
+      const startedAt = Date.now();
 
       const request = new Request(sql, (err, rowCount) => {
-        log(
-          "Request complete, err:",
-          err ? err.message : "none",
-          "rows:",
-          rowCount,
-          "chunks:",
-          responseChunks.length,
-        );
+        const ms = Date.now() - startedAt;
+        if (err) {
+          warn(`Query failed (${ms}ms):`, err.message);
+        } else {
+          info(`Query ok (${ms}ms, ${rowCount} rows)`);
+        }
         if (err && responseChunks.length === 0) {
           sendErrorResponse(err);
         } else {
@@ -789,7 +788,7 @@ function handleConnection(clientSocket) {
       });
 
       request.on("error", (err) => {
-        log("Query error:", err.message);
+        log("Query error event:", err.message);
       });
 
       azureConn.execSqlBatch(request);
@@ -1014,6 +1013,16 @@ function log(...args) {
     const ts = new Date().toISOString().substring(11, 23);
     console.log(`[${ts}]`, ...args);
   }
+}
+
+function info(...args) {
+  const ts = new Date().toISOString().substring(11, 23);
+  console.log(`[${ts}]`, ...args);
+}
+
+function warn(...args) {
+  const ts = new Date().toISOString().substring(11, 23);
+  console.error(`[${ts}]`, ...args);
 }
 
 function parseArgs(argv) {
